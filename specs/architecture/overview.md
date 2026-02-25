@@ -6,7 +6,7 @@ The engine follows a three-layer architecture to maximize flexibility and protot
 
 ### 1. Engine Layer (Low-level)
 Core systems that are game-agnostic:
-- Rendering pipeline (2D focus)
+- Rendering pipeline (2.5D isometric)
 - Input handling & controller abstraction
 - Asset loading & management
 - Audio system
@@ -15,12 +15,12 @@ Core systems that are game-agnostic:
 
 ### 2. Tactics Layer (Mid-level)
 Tactical game abstractions:
-- Hex grid mathematics & coordinate systems
-- Pathfinding (A* with movement costs)
-- Line of sight calculations
+- Hex grid mathematics & 3D coordinate systems (elevation)
+- Pathfinding (A* with movement costs and elevation)
+- Line of sight calculations (3D, elevation-aware)
 - Turn-based state machine
-- Combat resolution system
-- AI behavior framework
+- Combat resolution system (elevation bonuses, fall damage)
+- AI behavior framework (elevation-aware tactics)
 
 ### 3. Content Layer (High-level)
 Game-specific implementations:
@@ -54,10 +54,11 @@ Game-specific implementations:
 - Status effect management
 
 ### Rendering
-- Hex grid rendering with coordinate-to-pixel conversion
-- Sprite layering (terrain → objects → units → effects → UI)
-- Camera system (pan, zoom, maybe per-player viewports)
-- Animation system (tweening for movement, attacks, effects)
+- Isometric hex grid rendering with 3D coordinate-to-pixel conversion
+- Depth-sorted sprite layering (terrain → objects → units → effects → UI)
+- Elevation and multi-level terrain support
+- Camera system (pan, zoom, optional rotation, per-player viewports)
+- Animation system (directional sprites, tweening, elevation transitions)
 
 ### Input
 - Multi-controller support (2-8 players)
