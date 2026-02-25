@@ -50,7 +50,12 @@ A Rust-based game engine designed for couch co-op tactical strategy games with *
 ```
 specs/
 ├── architecture/
-│   └── overview.md              - System architecture and tech stack
+│   ├── overview.md              - High-level system design
+│   ├── components.md            - Detailed component breakdown
+│   ├── data-flow.md             - System communication patterns
+│   ├── modules.md               - Crate and module organization
+│   ├── testing.md               - Testing strategy and practices
+│   └── build-deploy.md          - Build pipeline and deployment
 ├── features/
 │   ├── hex-grid.md              - 3D hex coordinates, pathfinding, LOS
 │   ├── combat-system.md         - Initiative, attacks, elevation bonuses
@@ -67,6 +72,19 @@ specs/
 │   └── level-editor.md          - Integrated map editor
 └── api/                         - API designs (planned)
 ```
+
+## Architecture Documentation
+
+Comprehensive implementation guidelines:
+
+### System Design
+- **components.md**: Detailed breakdown of all major systems (rendering, input, audio, ECS, etc.)
+- **data-flow.md**: How data flows through the engine (turn loop, input processing, rendering pipeline)
+- **modules.md**: Crate structure, module organization, and public API design
+
+### Development Practices
+- **testing.md**: Unit testing, integration testing, benchmarking, and CI/CD
+- **build-deploy.md**: Build configurations, asset processing, platform-specific builds, and deployment
 
 ## Key Specifications
 
