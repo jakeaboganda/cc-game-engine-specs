@@ -2,221 +2,525 @@
 
 ## Overview
 
-2D rendering focused on tactical hex-based games with support for layered sprites, animations, and effects.
+**2.5D isometric rendering** for tactical hex-based games. Combines the visual depth of 3D with the performance and art workflow of 2D sprites. Supports elevation, shadows, and depth-sorted rendering.
 
-## Design Choice: Renderer Abstraction
+## Design Philosophy
 
-The engine should support multiple rendering backends through a trait-based system:
+**2.5D approach**:
+- Isometric or dimetric projection (angled view, not top-down)
+- Sprites rendered with depth sorting based on Y-position and elevation
+- Visual height differences (units on cliffs, multi-level terrain)
+- Shadows cast on ground plane
+- Option for 3D models rendered in isometric view OR pre-rendered 2D sprites
+
+**Why 2.5D**:
+- Better spatial awareness than flat 2D
+- Easier to read elevation and unit positioning
+- More immersive tactical feel
+- Simpler art pipeline than full 3D
+- Classic tactical RPG aesthetic (XCOM, Tactics Ogre, FFT)
+
+## Projection System
+
+### Isometric vs Dimetric
 
 ```rust
-trait Renderer {
-    fn render_sprite(&mut self, sprite: &Sprite, transform: Transform);
-    fn render_hex_grid(&mut self, grid: &HexGrid, camera: &Camera);
-    fn render_text(&mut self, text: &str, font: &Font, position: Vec2);
-    fn render_effect(&mut self, effect: &ParticleEffect);
-    fn present(&mut self);
+enum ProjectionMode {
+    Isometric,      // 1:2 ratio (26.565° angle), true isometric
+    Dimetric,       // 1:1.5 ratio (~30° angle), slightly less steep
+    Custom(f32),    // Custom angle in degrees
+}
+
+struct ProjectionMatrix {
+    mode: ProjectionMode,
+    tile_width: f32,   // Base hex width in pixels
+    tile_height: f32,  // Base hex height in pixels
+    elevation_scale: f32,  // Pixels per elevation level
 }
 ```
 
-**Primary backend**: wgpu (cross-platform, modern, Rust-native)
-**Alternative**: Bevy renderer (if using Bevy ECS)
-
-## Rendering Pipeline
-
-### Layer System
-
-Render order (back to front):
-1. **Background** - Skybox, far background
-2. **Terrain** - Hex tiles, ground textures
-3. **Terrain Features** - Trees, rocks, water
-4. **Ground Effects** - AoE indicators, selection highlights
-5. **Units** - Characters, enemies
-6. **Unit Effects** - Status icons, health bars
-7. **Projectiles** - Arrows, spells in flight
-8. **Particles** - Explosions, magic effects
-9. **UI Overlays** - Turn indicators, range displays
-10. **UI** - Menus, dialogs, HUD
-
-Each layer has a z-index for fine control within that layer.
-
-### Sprite System
-
-```rust
-struct Sprite {
-    texture: TextureHandle,
-    source_rect: Option<Rect>,  // for sprite sheets
-    tint: Color,
-    flip_x: bool,
-    flip_y: bool,
-}
-
-struct SpriteSheet {
-    texture: TextureHandle,
-    frame_width: u32,
-    frame_height: u32,
-    frames: Vec<Rect>,
-}
-```
-
-**Features**:
-- Sprite batching for performance (batch identical textures)
-- Automatic atlasing for small sprites
-- 9-slice scaling for UI panels
-- Multi-sprite rendering (composite units with equipment)
-
-### Hex Grid Rendering
-
-```rust
-struct HexRenderer {
-    tile_radius: f32,
-    flat_top: bool,  // vs pointy-top
-}
-```
-
-**Rendering modes**:
-1. **Textured** - Each hex has terrain sprite
-2. **Colored** - Flat colors with borders
-3. **Procedural** - Generated textures based on terrain type
-4. **Mixed** - Blend textures at borders (grass → sand transition)
-
-**Grid overlays**:
-- Movement range (blue highlight)
-- Attack range (red highlight)
-- AoE preview (semi-transparent danger zone)
-- Pathfinding visualization (arrow trail)
+**Standard isometric (recommended)**:
+- 2:1 pixel ratio for tiles
+- 30° camera angle from horizontal
+- Clean, readable, proven in many games
 
 ### Coordinate Conversion
 
 ```rust
-// Hex (cube coords) to screen pixels
-fn hex_to_pixel(hex: HexCoord, radius: f32) -> Vec2 {
-    let x = radius * (3.0_f32.sqrt() * hex.q as f32 
-                      + 3.0_f32.sqrt() / 2.0 * hex.r as f32);
-    let y = radius * (3.0 / 2.0 * hex.r as f32);
-    Vec2::new(x, y)
+// Hex cube coords + elevation → isometric screen position
+fn hex_to_iso_pixel(hex: HexCoord, elevation: i32, projection: &ProjectionMatrix) -> Vec3 {
+    // First convert hex to flat 2D position
+    let flat_x = projection.tile_width * (3.0_f32.sqrt() * hex.q as f32 
+                                          + 3.0_f32.sqrt() / 2.0 * hex.r as f32);
+    let flat_y = projection.tile_width * (3.0 / 2.0 * hex.r as f32);
+    
+    // Apply isometric transformation
+    let iso_x = (flat_x - flat_y) * 0.5;
+    let iso_y = (flat_x + flat_y) * 0.25;
+    
+    // Add elevation (higher = render higher on screen)
+    let screen_y = iso_y - (elevation as f32 * projection.elevation_scale);
+    
+    Vec3::new(iso_x, screen_y, elevation as f32)  // Z stored for depth sorting
 }
 
-// Screen pixels to hex coords (for mouse picking)
-fn pixel_to_hex(pos: Vec2, radius: f32) -> HexCoord {
-    let q = (pos.x * 3.0_f32.sqrt() / 3.0 - pos.y / 3.0) / radius;
-    let r = pos.y * 2.0 / 3.0 / radius;
+// Screen pixel → hex coord (for mouse picking)
+fn iso_pixel_to_hex(screen_pos: Vec2, elevation: i32, projection: &ProjectionMatrix) -> HexCoord {
+    // Reverse isometric transformation
+    let adjusted_y = screen_pos.y + (elevation as f32 * projection.elevation_scale);
+    
+    let flat_x = screen_pos.x + adjusted_y * 2.0;
+    let flat_y = adjusted_y * 2.0 - screen_pos.x;
+    
+    // Convert flat coords to hex
+    let q = (flat_x * 3.0_f32.sqrt() / 3.0 - flat_y / 3.0) / projection.tile_width;
+    let r = flat_y * 2.0 / 3.0 / projection.tile_width;
+    
     hex_round(q, r)
 }
 ```
 
-## Camera System
+## Depth Sorting
+
+Critical for correct visual layering:
 
 ```rust
-struct Camera {
-    position: Vec2,        // world position
-    zoom: f32,             // 1.0 = normal, 2.0 = 2x zoom
-    rotation: f32,         // radians (typically 0 for top-down)
-    viewport: Rect,        // screen area to render to
+struct DepthSortedSprite {
+    sprite: Sprite,
+    position: Vec3,      // x, y, elevation
+    depth_bias: f32,     // Manual adjustment for edge cases
+}
+
+impl DepthSortedSprite {
+    fn depth_key(&self) -> i32 {
+        // Primary: Y position (back-to-front)
+        // Secondary: Elevation (higher objects in front when at same Y)
+        // Tertiary: Bias (manual override)
+        
+        let y_priority = (self.position.y * 1000.0) as i32;
+        let elevation_priority = (self.position.z * 10.0) as i32;
+        let bias_priority = (self.depth_bias * 100.0) as i32;
+        
+        y_priority - elevation_priority + bias_priority
+    }
+}
+
+fn sort_sprites(sprites: &mut Vec<DepthSortedSprite>) {
+    sprites.sort_by_key(|s| s.depth_key());
 }
 ```
 
-### Camera Features
+**Sorting rules**:
+1. Objects further back (higher Y) render first
+2. At same Y, higher elevation renders in front
+3. Manual bias for special cases (flying units, effects)
+
+**Optimization**: Use spatial hashing to avoid sorting all sprites every frame—only sort within visible chunks.
+
+## Elevation System
+
+Multi-level terrain and units:
+
+```rust
+struct ElevationConfig {
+    levels: Vec<f32>,          // [0.0, 1.0, 2.0, 3.0] etc.
+    height_per_level: f32,     // Pixels of vertical offset per level
+    transition_slope: bool,    // Smooth ramps vs hard cliffs
+}
+
+struct TerrainTile {
+    hex: HexCoord,
+    elevation: i32,            // Base elevation level
+    terrain_type: TerrainType,
+    corners: Option<[i32; 6]>, // Elevation of each hex corner (for slopes)
+}
+```
+
+**Visual representation**:
+- **Flat terrain**: All corners same elevation
+- **Slopes**: Gradual corner transitions (walkable)
+- **Cliffs**: Sharp drops (require climbing or flying)
+- **Elevation walls**: Render cliff faces between levels
+
+### Cliff Rendering
+
+```rust
+fn render_cliff_face(tile: &TerrainTile, neighbor: &TerrainTile) {
+    if tile.elevation > neighbor.elevation {
+        let height_diff = tile.elevation - neighbor.elevation;
+        
+        // Render vertical wall sprite
+        let wall_sprite = get_cliff_sprite(tile.terrain_type, height_diff);
+        let position = calculate_wall_position(tile, neighbor);
+        
+        render_sprite(wall_sprite, position);
+    }
+}
+```
+
+**Cliff tiles**:
+- Different sprites for 1-level, 2-level, 3+ level drops
+- Corner pieces for inside/outside corners
+- Match terrain type (grass cliff, stone cliff, etc.)
+
+## Shadow System
+
+Ground shadows for depth perception:
+
+```rust
+struct ShadowRenderer {
+    shadow_offset: Vec2,     // Direction and distance of shadow
+    shadow_alpha: f32,       // Opacity (0.0-1.0)
+    elevation_multiplier: f32,  // Higher units = longer shadows
+}
+
+fn render_unit_shadow(unit: &Unit, config: &ShadowRenderer) {
+    let shadow_pos = Vec2::new(
+        unit.position.x + config.shadow_offset.x,
+        unit.position.y + config.shadow_offset.y + (unit.elevation as f32 * config.elevation_multiplier),
+    );
+    
+    let shadow_sprite = Sprite {
+        texture: unit.sprite.texture,
+        tint: Color::rgba(0.0, 0.0, 0.0, config.shadow_alpha),
+        // Squash shadow vertically for perspective
+        scale: Vec2::new(1.0, 0.5),
+        ..unit.sprite
+    };
+    
+    render_sprite_at_ground_level(shadow_sprite, shadow_pos);
+}
+```
+
+**Types**:
+- **Blob shadows**: Simple circular shadow under units
+- **Sprite shadows**: Silhouette of unit sprite (more realistic)
+- **Dynamic shadows**: Change with lighting direction (advanced)
+
+## Camera System
+
+```rust
+struct IsometricCamera {
+    position: Vec3,          // World position (x, y, elevation)
+    zoom: f32,               // Scale factor
+    pitch: f32,              // Vertical angle (fixed for pure iso, adjustable for 2.5D)
+    yaw: f32,                // Rotation around vertical axis (usually fixed)
+    viewport: Rect,
+    projection: ProjectionMatrix,
+}
+```
+
+### Camera Controls
 
 **Movement**:
-- Pan (WASD or edge scrolling)
-- Zoom (mouse wheel, pinch-to-zoom)
-- Snap to unit
-- Follow selected unit
-- Smooth interpolation (ease in/out)
+- Pan in isometric space (WASD moves along iso axes, not screen axes)
+- Zoom in/out (scale entire view)
+- Optional rotation (rotate world in 90° increments for different viewing angles)
 
-**Multi-camera** (for split-screen co-op):
+**Focus modes**:
+- Free-cam: Player controls
+- Unit-follow: Camera tracks selected unit
+- Cinematic: Scripted camera paths for abilities
+
+### Multi-Camera (Split-Screen)
+
 ```rust
-struct CameraManager {
-    cameras: Vec<Camera>,
+struct IsoCameraManager {
+    cameras: Vec<IsometricCamera>,
     layout: CameraLayout,
 }
 
 enum CameraLayout {
-    Single,                    // Full screen
-    Horizontal2,               // Top/bottom split
-    Vertical2,                 // Left/right split
-    Quad,                      // 4-way split
-    Custom(Vec<Rect>),         // Arbitrary layouts
+    Single,
+    Horizontal2,
+    Vertical2,
+    Quad,
 }
 ```
 
-**Culling**:
-- Only render hexes visible in camera frustum
-- Cull sprites outside view
-- Distance-based LOD (optional, for large sprites)
+Each camera has independent position/zoom but shares projection settings.
+
+## Rendering Pipeline
+
+### Render Passes
+
+```
+1. Terrain Base
+   ├─ Ground tiles (elevation 0)
+   ├─ Elevated terrain (elevation 1+)
+   └─ Cliff faces
+
+2. Ground Shadows
+   └─ All unit/object shadows on ground plane
+
+3. Depth-Sorted Objects
+   ├─ Terrain features (trees, rocks)
+   ├─ Units (sorted by Y + elevation)
+   ├─ Effects (particles, spells)
+   └─ Projectiles
+
+4. Overlays (no depth)
+   ├─ Selection highlights
+   ├─ Range indicators
+   ├─ Health bars
+   └─ Status icons
+
+5. UI Layer
+   ├─ HUD
+   ├─ Menus
+   └─ Tooltips
+```
+
+### Batching Strategy
+
+```rust
+struct IsometricRenderBatch {
+    texture: TextureHandle,
+    sprites: Vec<(Sprite, Vec3)>,  // (sprite, world_pos)
+    depth_sorted: bool,
+}
+
+fn prepare_batches(entities: &[Entity]) -> Vec<IsometricRenderBatch> {
+    let mut batches = HashMap::new();
+    
+    for entity in entities {
+        let key = (entity.sprite.texture, entity.render_layer);
+        batches.entry(key)
+            .or_insert_with(Vec::new)
+            .push((entity.sprite, entity.position));
+    }
+    
+    // Sort each batch by depth
+    for batch in batches.values_mut() {
+        batch.sort_by_key(|(_, pos)| depth_key(pos));
+    }
+    
+    batches.into_iter()
+        .map(|((texture, _), sprites)| IsometricRenderBatch {
+            texture,
+            sprites,
+            depth_sorted: true,
+        })
+        .collect()
+}
+```
+
+## 3D Models Option
+
+Support actual 3D models rendered in isometric view:
+
+```rust
+enum RenderMode {
+    Sprites2D,           // Pre-rendered sprite sheets
+    Models3D,            // Real-time 3D models
+    Hybrid,              // Mix both (3D units, 2D terrain)
+}
+
+struct Model3DRenderer {
+    mesh: MeshHandle,
+    materials: Vec<MaterialHandle>,
+    animation_state: AnimationState,
+}
+
+fn render_3d_in_isometric_view(model: &Model3DRenderer, position: Vec3, camera: &IsometricCamera) {
+    // Set orthographic projection matching isometric angle
+    let ortho_matrix = create_orthographic_projection(
+        camera.projection.mode,
+        camera.zoom,
+    );
+    
+    // Render 3D model with fixed camera angle
+    let view_matrix = create_isometric_view_matrix(camera.pitch, camera.yaw);
+    
+    render_mesh(model.mesh, ortho_matrix * view_matrix, position);
+}
+```
+
+**Hybrid approach (recommended)**:
+- 3D models for units (easier animation, rotation)
+- 2D sprites for terrain (faster, stylized look)
+- Depth buffer ensures correct layering
+
+## Hex Grid Rendering (Isometric)
+
+```rust
+struct IsometricHexRenderer {
+    tile_sprites: HashMap<TerrainType, TextureHandle>,
+    elevation_sprites: HashMap<(TerrainType, i32), TextureHandle>,  // Cliff sprites
+    grid_overlay: bool,
+}
+
+fn render_hex_tile(hex: &TerrainTile, renderer: &IsometricHexRenderer) {
+    let screen_pos = hex_to_iso_pixel(hex.hex, hex.elevation, &projection);
+    
+    // Base tile sprite
+    let sprite = renderer.tile_sprites.get(&hex.terrain_type);
+    render_sprite(sprite, screen_pos);
+    
+    // Elevation walls (if higher than neighbors)
+    for direction in HexDirection::all() {
+        let neighbor = get_neighbor(hex, direction);
+        if hex.elevation > neighbor.elevation {
+            render_cliff_face(hex, &neighbor);
+        }
+    }
+}
+```
+
+**Grid overlay**:
+- Outline each hex with subtle lines
+- Highlight on hover
+- Show movement/attack range with colored overlays
+
+## Sprite Art Requirements
+
+For 2.5D sprites:
+
+**Units**:
+- 8 directions (N, NE, E, SE, S, SW, W, NW) OR
+- 4 directions (NE, SE, SW, NW) with flipping
+- Multiple animation frames per direction
+- Consistent lighting angle (top-left for isometric)
+
+**Terrain**:
+- Hex tiles fitting isometric grid
+- Cliff edge sprites (straight, inside corner, outside corner)
+- Transition tiles between terrain types
+- Elevation variations (base, level 1, level 2, etc.)
+
+**Effects**:
+- Particles rendered as billboards (always face camera)
+- Spell effects with consistent perspective
 
 ## Shaders
 
-Basic shader pipeline:
-
-1. **Sprite shader**: Standard textured quad with tint
-2. **Hex outline shader**: Draw hex borders
-3. **Highlight shader**: Animated glow for selection
-4. **Fog of war shader**: Darken/desaturate unexplored areas
-5. **Status effect shader**: Color overlays (poisoned = green tint)
-
-Custom shaders for special effects:
-- Ripple effect for water
-- Fire/glow animation
-- Screen shake on impact
-- Flash on damage
-
-## Performance Targets
-
-- **60 FPS** on mid-range hardware (5-year-old laptop)
-- **1000+ sprites** on screen simultaneously
-- **50x50 hex grid** rendered with no frame drops
-
-### Optimization Strategies
-
-1. **Batching**: Group draw calls by texture
-2. **Culling**: Don't render off-screen objects
-3. **Dirty rectangles**: Only redraw changed areas (for static grids)
-4. **Texture atlases**: Combine small textures
-5. **Instancing**: Render many identical sprites in one call
-6. **Asset streaming**: Load/unload textures based on camera position
-
-## Debug Rendering
-
-Toggle-able debug overlays:
-- Hex coordinate labels
-- FPS counter
-- Draw call count
-- Culling visualization (show frustum)
-- Collision bounds
-- Pathfinding costs (color-coded)
-- LOS rays
-
 ```rust
-struct DebugRenderer {
-    show_hex_coords: bool,
-    show_fps: bool,
-    show_bounds: bool,
-    show_pathfinding: bool,
+// Vertex shader: Transform to isometric space
+fn vertex_main(position: Vec3, tex_coords: Vec2) -> VertexOutput {
+    let iso_pos = apply_isometric_projection(position, projection_matrix);
+    
+    VertexOutput {
+        position: iso_pos,
+        tex_coords: tex_coords,
+        elevation: position.z,
+    }
+}
+
+// Fragment shader: Apply tint, shadows, effects
+fn fragment_main(input: VertexOutput) -> Color {
+    let base_color = sample_texture(input.tex_coords);
+    
+    // Elevation-based darkening (lower = darker)
+    let elevation_tint = 1.0 - (input.elevation * 0.05);
+    
+    // Apply fog of war
+    let fog_amount = sample_fog_map(input.world_pos);
+    
+    base_color * elevation_tint * fog_amount
 }
 ```
 
-## Resolution & Scaling
+**Custom shaders**:
+- Water ripple (offset UV coordinates)
+- Fire/glow (additive blending + animation)
+- Outline (edge detection for selection)
+- Fog of war (darken/desaturate unexplored areas)
 
-Support multiple resolutions:
-- **Native rendering**: Pick target resolution (1920x1080, etc.)
-- **Scaling modes**:
-  - Pixel-perfect (integer scaling for retro look)
-  - Smooth (bilinear/trilinear filtering)
-  - Adaptive (scale to fit window, maintain aspect ratio)
+## Lighting (Optional Advanced Feature)
 
-**HiDPI support**: Detect and render at native resolution on retina displays.
+Dynamic lighting in 2.5D:
+
+```rust
+struct Light {
+    position: Vec3,
+    color: Color,
+    intensity: f32,
+    radius: f32,
+}
+
+fn apply_lighting(sprite_pos: Vec3, lights: &[Light]) -> Color {
+    let mut total_light = Color::BLACK;
+    
+    for light in lights {
+        let distance = (light.position - sprite_pos).length();
+        if distance < light.radius {
+            let attenuation = 1.0 - (distance / light.radius).powi(2);
+            total_light += light.color * light.intensity * attenuation;
+        }
+    }
+    
+    total_light.clamp(0.0, 1.0)
+}
+```
+
+**Use cases**:
+- Torch light in dark dungeons
+- Spell effects casting light
+- Day/night cycle
+- Fire/lava glow
+
+## Performance Targets
+
+- **60 FPS** on mid-range hardware
+- **100+ units** on screen with elevation
+- **50x50 hex map** with multi-level terrain
+- **Smooth depth sorting** (< 2ms per frame)
+
+### Optimization Strategies
+
+1. **Spatial partitioning**: Only sort sprites in visible chunks
+2. **Frustum culling**: Don't render off-screen objects
+3. **Occlusion culling**: Higher terrain blocks lower objects (optional)
+4. **Instancing**: Batch identical sprites at different positions
+5. **Level-of-detail**: Simpler sprites for distant objects
+6. **Pre-sorted layers**: Static terrain doesn't need per-frame sorting
+
+## Debug Rendering
+
+```rust
+struct IsometricDebugger {
+    show_hex_coords: bool,
+    show_elevation_numbers: bool,
+    show_depth_order: bool,       // Color-code by render order
+    show_bounding_boxes: bool,
+    show_shadows: bool,
+    wireframe_mode: bool,
+}
+```
+
+**Visualizations**:
+- Elevation heat map (color by height)
+- Depth sort order (numbers on sprites)
+- Hex grid overlay
+- Shadow direction indicators
 
 ## Accessibility
 
-- **Color-blind modes**: Alternative color palettes for team/range indicators
-- **High contrast mode**: Stronger outlines, bolder colors
-- **Zoom limits**: Allow zooming closer for better visibility
-- **Icon clarity**: Large, clear icons with text labels
+- **Camera rotation**: Allow 90° increments for different view angles
+- **Elevation indicators**: Visual markers for height differences
+- **High contrast mode**: Stronger outlines, clearer shadows
+- **Zoom range**: 0.5x to 3.0x for better visibility
+
+## Platform Considerations
+
+- **Mobile**: Larger touch targets, pinch-to-zoom, two-finger pan
+- **Desktop**: Mouse-based camera, hover tooltips, scroll-wheel zoom
+- **Console**: Gamepad cursor, snap-to-unit navigation
+
+## Example Art Pipeline
+
+1. **3D modeling**: Create unit in Blender
+2. **Render**: Export 8-direction sprite sheets at isometric angle
+3. **Post-process**: Add outlines, optimize palette
+4. **Import**: Load sprite sheet with animation frames
+5. **In-engine**: Render with depth sorting and shadows
+
+OR use real-time 3D with orthographic camera for dynamic angles/animations.
 
 ## Future Extensions
 
-- **Lighting system**: Dynamic lights, shadows from tall units
-- **Weather effects**: Rain, fog, snow overlays
-- **3D isometric**: Transition to 2.5D while keeping hex grid
-- **Shader effects**: More advanced post-processing (bloom, chromatic aberration)
+- **Dynamic weather**: Rain, snow, fog affecting visibility
+- **Destructible terrain**: Cliffs crumble, walls collapse
+- **Volumetric effects**: Smoke, magic clouds
+- **Normal mapping**: Fake lighting detail on sprites
+- **Parallax backgrounds**: Multi-layer scrolling for depth
