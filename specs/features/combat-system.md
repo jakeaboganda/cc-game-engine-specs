@@ -33,14 +33,19 @@ struct Movement {
     speed: i32,              // hexes per turn
     current_spent: i32,      // hexes moved this turn
     terrain_cost: HashMap<TerrainType, i32>,
+    can_climb: bool,         // Can move up cliffs
+    can_fly: bool,           // Ignores elevation costs
 }
 ```
 
 **Rules**:
 - Difficult terrain costs 2 movement per hex
+- Moving uphill costs extra (see hex-grid.md for elevation movement costs)
 - Moving through allied units: costs normal movement
 - Moving through enemy units: requires special ability or impossible
 - Opportunity attacks: enemies may attack when you leave threatened hexes
+- Jumping down: Free movement down 1 level, may take fall damage for 2+
+- Flying units: Ignore elevation, can cross cliffs
 
 ### Attacks
 
@@ -50,21 +55,65 @@ struct Attack {
     hit_bonus: i32,
     damage: DiceRoll,       // e.g., 2d6 + 3
     damage_type: DamageType,
+    uses_3d_range: bool,    // If true, accounts for elevation in range calc
 }
 
 enum Range {
     Melee(i32),            // adjacent hexes
-    Ranged(i32, i32),      // min and max range
+    Ranged(i32, i32),      // min and max range (horizontal distance)
+    Ranged3D(i32, i32),    // 3D distance (accounts for elevation)
     Touch,                  // same hex only
 }
 ```
 
 **Attack resolution**:
-1. Check range & line of sight
-2. Roll to hit: `1d20 + hit_bonus >= target_armor`
-3. On success, roll damage
-4. Apply resistances/vulnerabilities
-5. Subtract from target HP
+1. Check range & line of sight (3D-aware, see hex-grid.md)
+2. Calculate elevation bonus/penalty
+3. Roll to hit: `1d20 + hit_bonus + elevation_modifier >= target_armor`
+4. On success, roll damage (may get bonus damage from high ground)
+5. Apply resistances/vulnerabilities
+6. Subtract from target HP
+
+### Elevation Combat Modifiers
+
+```rust
+fn calculate_elevation_modifier(attacker: HexPosition, target: HexPosition) -> CombatModifier {
+    let elevation_diff = attacker.elevation - target.elevation;
+    
+    CombatModifier {
+        to_hit: match elevation_diff {
+            d if d >= 2 => 3,    // Major high ground: +3 to hit
+            1 => 2,              // Minor high ground: +2 to hit
+            0 => 0,              // Even ground: no modifier
+            -1 => -1,            // Shooting uphill: -1 to hit
+            _ => -2,             // Major low ground: -2 to hit
+        },
+        damage_bonus: match elevation_diff {
+            d if d >= 2 => 2,    // +2 damage from major high ground
+            1 => 1,              // +1 damage from minor high ground
+            _ => 0,
+        },
+        crit_chance: if elevation_diff >= 1 { 1 } else { 0 },  // +5% crit from high ground
+    }
+}
+
+struct CombatModifier {
+    to_hit: i32,
+    damage_bonus: i32,
+    crit_chance: i32,
+}
+```
+
+**High ground advantages**:
+- Easier to hit targets below you (better angle of attack)
+- Bonus damage (gravity assists melee, clear shot for ranged)
+- Increased critical hit chance
+- Better line of sight (see over obstacles)
+
+**Low ground disadvantages**:
+- Harder to hit targets above you
+- Target may have cover from elevation
+- Reduced visibility
 
 ### Abilities
 
@@ -78,7 +127,8 @@ struct Ability {
 }
 
 enum TargetRule {
-    SingleEnemy(i32),       // range
+    SingleEnemy(i32),       // range (horizontal)
+    SingleEnemy3D(i32, i32), // (horizontal range, vertical range)
     SingleAlly(i32),
     AreaOfEffect(AoeShape),
     Self,
@@ -86,10 +136,56 @@ enum TargetRule {
 
 enum AoeShape {
     Circle { center: HexCoord, radius: i32 },
+    Circle3D { center: HexPosition, radius: i32, vertical_spread: i32 },
     Cone { origin: HexCoord, direction: Direction, length: i32 },
     Line { start: HexCoord, end: HexCoord, width: i32 },
+    Cylinder { center: HexPosition, radius: i32, height: i32 },  // Full vertical column
 }
 ```
+
+**3D Area Effects**:
+
+```rust
+fn get_targets_in_3d_aoe(shape: &AoeShape, map: &HexMap) -> Vec<HexPosition> {
+    match shape {
+        AoeShape::Circle3D { center, radius, vertical_spread } => {
+            let mut targets = Vec::new();
+            
+            for hex in hexes_in_range(center.hex, *radius) {
+                for elev in (center.elevation - vertical_spread)..=(center.elevation + vertical_spread) {
+                    let pos = HexPosition { hex, elevation: elev };
+                    
+                    // Check 3D distance
+                    if distance_3d(*center, pos) <= *radius as f32 {
+                        targets.push(pos);
+                    }
+                }
+            }
+            
+            targets
+        },
+        AoeShape::Cylinder { center, radius, height } => {
+            // Hit all units in radius from base_elevation to base_elevation + height
+            let mut targets = Vec::new();
+            
+            for hex in hexes_in_range(center.hex, *radius) {
+                for elev in center.elevation..=(center.elevation + height) {
+                    targets.push(HexPosition { hex, elevation: elev });
+                }
+            }
+            
+            targets
+        },
+        // ... other shapes
+    }
+}
+```
+
+**Examples**:
+- **Fireball**: `Circle3D` - Spherical explosion, hits adjacent elevations
+- **Lightning Strike**: `Cylinder` - Hits entire vertical column
+- **Earthquake**: `Circle` (2D only) - Ground-based effect, single elevation
+- **Meteor**: Originates high, impacts ground with splash (elevation-based damage falloff)
 
 ## Status Effects
 
@@ -141,6 +237,64 @@ enum ResistType {
     Quarter,   // take 25% damage
 }
 ```
+
+### Falling Damage
+
+Units that move or are pushed off cliffs take falling damage:
+
+```rust
+fn calculate_fall_damage(fall_distance: i32) -> i32 {
+    match fall_distance {
+        0..=1 => 0,                    // No damage from 1 level
+        2 => roll_dice("1d6"),         // Minor fall
+        3 => roll_dice("2d6"),         // Moderate fall
+        4 => roll_dice("3d6"),         // Serious fall
+        d if d >= 5 => roll_dice("4d6") + (d - 5) * 6,  // Deadly fall
+        _ => 0,
+    }
+}
+
+fn apply_knockback_with_fall(
+    unit: &mut Unit,
+    direction: HexDirection,
+    distance: i32,
+    map: &HexMap,
+) {
+    let mut current_pos = unit.position;
+    let mut highest_elevation = current_pos.elevation;
+    
+    for step in 0..distance {
+        let next_hex = current_pos.hex.neighbor(direction);
+        let next_tile = map.get_tile(next_hex);
+        
+        // Check if we fall off an edge
+        if next_tile.base_elevation < current_pos.elevation {
+            // Unit is knocked off a cliff
+            let fall_damage = calculate_fall_damage(current_pos.elevation - next_tile.base_elevation);
+            unit.take_damage(fall_damage, DamageType::Falling);
+            
+            // Land at lower elevation
+            current_pos = HexPosition {
+                hex: next_hex,
+                elevation: next_tile.base_elevation,
+            };
+            break;
+        } else {
+            current_pos.hex = next_hex;
+            current_pos.elevation = next_tile.base_elevation;
+            highest_elevation = highest_elevation.max(current_pos.elevation);
+        }
+    }
+    
+    unit.position = current_pos;
+}
+```
+
+**Abilities that cause falling**:
+- **Knockback**: Push enemy off cliff
+- **Bull Rush**: Charge through enemy, potentially off edge
+- **Gravity Well**: Pull all units to center, falling from elevated positions
+- **Shockwave**: Radial knockback from caster
 
 ## Combat Events
 
