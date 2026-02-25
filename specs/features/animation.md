@@ -1,39 +1,111 @@
-# Animation System
+# Animation System (2.5D Isometric)
 
 ## Overview
 
-2D sprite animation and tweening system for tactical games. Emphasis on clarity, readability, and smooth transitions.
+Sprite animation and tweening system for 2.5D isometric tactical games. Emphasis on directional animations, depth sorting, and elevation-aware movement.
 
 ## Animation Types
 
-### 1. Sprite Animation
+### 1. Isometric Sprite Animation
 
-Traditional frame-by-frame animation:
+Frame-by-frame animation with directional support:
 
 ```rust
-struct SpriteAnimation {
-    frames: Vec<TextureHandle>,
+struct IsometricSpriteAnimation {
+    directions: DirectionSet,
+    frames_per_direction: Vec<TextureHandle>,
     frame_duration: f32,     // seconds per frame
     loop_mode: LoopMode,
+    current_direction: Direction,
     current_frame: usize,
     elapsed: f32,
 }
 
-enum LoopMode {
-    Once,           // Play once, stop on last frame
-    Loop,           // Repeat forever
-    PingPong,       // Forward then backward
-    LoopN(u32),     // Loop N times then stop
+enum DirectionSet {
+    Single,            // No direction (particles, effects)
+    Four,              // N, E, S, W (with mirroring for NE, SE, SW, NW)
+    Eight,             // Full 8 directions (no mirroring needed)
+}
+
+enum Direction {
+    North,      // 0°
+    NorthEast,  // 45°
+    East,       // 90°
+    SouthEast,  // 135°
+    South,      // 180°
+    SouthWest,  // 225°
+    West,       // 270°
+    NorthWest,  // 315°
+}
+
+impl Direction {
+    fn from_angle(radians: f32) -> Self {
+        let degrees = radians.to_degrees().rem_euclid(360.0);
+        match degrees as i32 {
+            0..=22 | 338..=360 => Direction::North,
+            23..=67 => Direction::NorthEast,
+            68..=112 => Direction::East,
+            113..=157 => Direction::SouthEast,
+            158..=202 => Direction::South,
+            203..=247 => Direction::SouthWest,
+            248..=292 => Direction::West,
+            293..=337 => Direction::NorthWest,
+            _ => Direction::North,
+        }
+    }
+    
+    fn to_sprite_index(&self, use_mirroring: bool) -> (usize, bool) {
+        // Returns (sprite_index, should_flip_horizontal)
+        match (self, use_mirroring) {
+            (Direction::NorthEast, true) => (0, false),   // NE sprite
+            (Direction::East, true) => (1, false),         // E sprite
+            (Direction::SouthEast, true) => (2, false),    // SE sprite
+            (Direction::South, true) => (3, false),        // S sprite
+            (Direction::SouthWest, true) => (2, true),     // SE sprite flipped
+            (Direction::West, true) => (1, true),          // E sprite flipped
+            (Direction::NorthWest, true) => (0, true),     // NE sprite flipped
+            (Direction::North, true) => (3, false),        // Use S facing backwards (or separate N)
+            
+            // 8-direction (no flipping)
+            (Direction::North, false) => (0, false),
+            (Direction::NorthEast, false) => (1, false),
+            (Direction::East, false) => (2, false),
+            (Direction::SouthEast, false) => (3, false),
+            (Direction::South, false) => (4, false),
+            (Direction::SouthWest, false) => (5, false),
+            (Direction::West, false) => (6, false),
+            (Direction::NorthWest, false) => (7, false),
+        }
+    }
 }
 ```
 
-**Common animations**:
+**Common animations** (per direction):
 - Idle: Gentle breathing, slight movement
-- Walk/run: Stepping animation
-- Attack: Wind-up → strike → recovery
-- Hit: Flinch reaction
-- Death: Collapse
-- Spell cast: Charging → release
+- Walk/run: Stepping animation (4-8 frames)
+- Attack: Wind-up → strike → recovery (6-10 frames)
+- Hit: Flinch reaction (2-4 frames)
+- Death: Collapse (6-12 frames, ends with corpse sprite)
+- Spell cast: Charging → release (8-16 frames)
+- Jump/Fall: For elevation changes
+
+**Art asset organization**:
+```
+sprites/
+  warrior/
+    idle/
+      NE_0.png, NE_1.png, NE_2.png, NE_3.png
+      E_0.png, E_1.png, E_2.png, E_3.png
+      SE_0.png, SE_1.png, SE_2.png, SE_3.png
+      S_0.png, S_1.png, S_2.png, S_3.png
+    walk/
+      NE_0.png...NE_7.png
+      E_0.png...E_7.png
+      ...
+    attack/
+      NE_0.png...NE_9.png
+      ...
+```
 
 ### 2. Tweening (Interpolation)
 
@@ -90,15 +162,17 @@ struct ParticleEmitter {
 - Fire: Flickering flames
 - Smoke: Rising wisps
 
-## Animation Controller
+## Animation Controller (Isometric)
 
-State machine for unit animations:
+State machine for unit animations with directional support:
 
 ```rust
-struct AnimationController {
+struct IsometricAnimationController {
     current_state: AnimationState,
-    animations: HashMap<AnimationState, SpriteAnimation>,
+    current_direction: Direction,
+    animations: HashMap<(AnimationState, Direction), IsometricSpriteAnimation>,
     transitions: Vec<Transition>,
+    direction_set: DirectionSet,  // 4-way or 8-way
 }
 
 enum AnimationState {
@@ -109,6 +183,8 @@ enum AnimationState {
     TakingDamage,
     Dying,
     Dead,
+    Jumping,    // For elevation changes
+    Falling,    // For being pushed/falling off cliffs
 }
 
 struct Transition {
@@ -117,84 +193,267 @@ struct Transition {
     condition: TransitionCondition,
     blend_duration: f32,  // cross-fade time
 }
+
+impl IsometricAnimationController {
+    fn get_current_animation(&self) -> &IsometricSpriteAnimation {
+        let key = (self.current_state, self.current_direction);
+        self.animations.get(&key)
+            .or_else(|| {
+                // Fallback to closest direction if exact match not found
+                self.find_closest_direction_animation(self.current_state, self.current_direction)
+            })
+            .expect("Animation not found")
+    }
+    
+    fn set_direction(&mut self, new_direction: Direction) {
+        if self.current_direction != new_direction {
+            self.current_direction = new_direction;
+            // Reset animation to start with new direction
+            if let Some(anim) = self.animations.get_mut(&(self.current_state, new_direction)) {
+                anim.current_frame = 0;
+                anim.elapsed = 0.0;
+            }
+        }
+    }
+    
+    fn transition_to(&mut self, new_state: AnimationState) {
+        if self.current_state != new_state {
+            self.on_exit_state(self.current_state);
+            self.current_state = new_state;
+            self.on_enter_state(new_state);
+        }
+    }
+    
+    fn update(&mut self, dt: f32) {
+        if let Some(anim) = self.animations.get_mut(&(self.current_state, self.current_direction)) {
+            anim.elapsed += dt;
+            
+            if anim.elapsed >= anim.frame_duration {
+                anim.elapsed = 0.0;
+                anim.current_frame += 1;
+                
+                match anim.loop_mode {
+                    LoopMode::Once => {
+                        if anim.current_frame >= anim.frames_per_direction.len() {
+                            anim.current_frame = anim.frames_per_direction.len() - 1;
+                            self.on_animation_complete();
+                        }
+                    },
+                    LoopMode::Loop => {
+                        if anim.current_frame >= anim.frames_per_direction.len() {
+                            anim.current_frame = 0;
+                        }
+                    },
+                    // ... other loop modes
+                }
+            }
+        }
+    }
+    
+    fn on_animation_complete(&mut self) {
+        // Auto-transition based on state
+        match self.current_state {
+            AnimationState::Attacking => self.transition_to(AnimationState::Idle),
+            AnimationState::TakingDamage => self.transition_to(AnimationState::Idle),
+            AnimationState::Dying => self.transition_to(AnimationState::Dead),
+            AnimationState::Jumping => self.transition_to(AnimationState::Idle),
+            AnimationState::Falling => self.transition_to(AnimationState::Idle),
+            _ => {}
+        }
+    }
+}
 ```
 
 **Example flow**:
-1. Unit idle → Player clicks to move → transition to Moving
-2. Moving → Reaches destination → transition to Idle
-3. Idle → Takes damage → flash to TakingDamage → back to Idle
-4. Any state → HP = 0 → Dying → Dead (stop)
+1. Unit idle (facing SE) → Player clicks to move NE → transition to Moving + update direction to NE
+2. Moving (NE animation plays) → Reaches destination → transition to Idle (NE)
+3. Idle → Takes damage → flash to TakingDamage (same direction) → back to Idle
+4. Idle → Moves up cliff → Jumping animation → Idle at new elevation
+5. Any state → HP = 0 → Dying → Dead (final frame is corpse sprite)
 
-## Movement Animation
+**Direction persistence**: When transitioning states, keep the same direction unless explicitly changed (e.g., idle warrior facing NE transitions to attack NE).
 
-### Hex-to-Hex Movement
+## Movement Animation (Isometric 3D)
 
-Smooth movement between hexes:
+### Hex-to-Hex Movement with Elevation
+
+Smooth movement between hexes in isometric space:
 
 ```rust
-struct MovementAnimation {
-    path: Vec<HexCoord>,
+struct IsometricMovementAnimation {
+    path: Vec<HexPosition>,     // 3D path including elevation changes
     current_segment: usize,
-    segment_progress: f32,  // 0.0 to 1.0
-    speed: f32,             // hexes per second
+    segment_progress: f32,       // 0.0 to 1.0
+    speed: f32,                  // hexes per second
+    current_direction: Direction,
+    sprite_controller: AnimationController,
+    jump_arc_height: f32,        // For elevation transitions
 }
 
-fn update_movement(anim: &mut MovementAnimation, dt: f32) {
+fn update_movement(anim: &mut IsometricMovementAnimation, dt: f32) {
     anim.segment_progress += dt * anim.speed;
     
     if anim.segment_progress >= 1.0 {
         anim.segment_progress = 0.0;
         anim.current_segment += 1;
+        
+        // Update facing direction for next segment
+        if anim.current_segment < anim.path.len() - 1 {
+            anim.update_direction();
+        }
     }
     
     if anim.current_segment >= anim.path.len() - 1 {
         // Reached destination
+        anim.sprite_controller.transition_to(AnimationState::Idle);
     }
 }
 
-fn current_position(anim: &MovementAnimation) -> Vec2 {
-    let start = hex_to_pixel(anim.path[anim.current_segment]);
-    let end = hex_to_pixel(anim.path[anim.current_segment + 1]);
-    lerp(start, end, ease_out(anim.segment_progress))
+impl IsometricMovementAnimation {
+    fn current_position(&self) -> Vec3 {
+        let start = &self.path[self.current_segment];
+        let end = &self.path[self.current_segment + 1];
+        
+        // Convert to isometric screen space
+        let start_screen = hex_to_iso_pixel(*start, &projection);
+        let end_screen = hex_to_iso_pixel(*end, &projection);
+        
+        let t = ease_out(self.segment_progress);
+        
+        // Interpolate position
+        let x = lerp(start_screen.x, end_screen.x, t);
+        let y = lerp(start_screen.y, end_screen.y, t);
+        
+        // Add jump arc if changing elevation
+        let elevation_diff = end.elevation - start.elevation;
+        let jump_offset = if elevation_diff != 0 {
+            self.calculate_jump_arc(t, elevation_diff)
+        } else {
+            0.0
+        };
+        
+        Vec3::new(x, y - jump_offset, lerp(start.elevation as f32, end.elevation as f32, t))
+    }
+    
+    fn calculate_jump_arc(&self, t: f32, elevation_change: i32) -> f32 {
+        // Parabolic arc for jumps/falls
+        if elevation_change > 0 {
+            // Jumping up: arc peaks midway
+            self.jump_arc_height * (4.0 * t * (1.0 - t))
+        } else {
+            // Falling: steeper descent
+            let fall_curve = 1.0 - (1.0 - t).powi(2);
+            -elevation_change.abs() as f32 * fall_curve * 10.0
+        }
+    }
+    
+    fn update_direction(&mut self) {
+        let current = &self.path[self.current_segment];
+        let next = &self.path[self.current_segment + 1];
+        
+        // Calculate 2D direction (ignoring elevation)
+        let dx = next.hex.q - current.hex.q;
+        let dy = next.hex.r - current.hex.r;
+        let angle = (dy as f32).atan2(dx as f32);
+        
+        self.current_direction = Direction::from_angle(angle);
+        
+        // Update sprite animation direction
+        self.sprite_controller.set_direction(self.current_direction);
+    }
 }
 ```
 
 **Features**:
 - Smooth easing (not linear)
-- Face direction of movement
-- Pause on obstacles (if path becomes blocked)
-- Speed up/down based on terrain
+- Automatic direction updates per segment
+- Jump/fall arcs for elevation changes
+- Pause on obstacles (if path becomes blocked mid-animation)
+- Speed variations based on terrain
+- Footstep particles aligned to isometric ground
 
-### Projectile Animation
+**Elevation transition animations**:
+- **Level terrain**: Standard walk/run cycle
+- **Uphill**: Slower animation, lean forward slightly
+- **Downhill**: Faster animation, lean back
+- **Jumping up 1 level**: Jump animation with arc
+- **Falling 2+ levels**: Freefall animation → landing impact
 
-For ranged attacks:
+### Projectile Animation (3D)
+
+### Projectile Animation (3D)
+
+For ranged attacks with elevation:
 
 ```rust
-struct ProjectileAnimation {
-    start: Vec2,
-    end: Vec2,
-    arc_height: f32,       // Parabolic arc
+struct ProjectileAnimation3D {
+    start: HexPosition,
+    end: HexPosition,
+    arc_height: f32,         // Additional arc beyond elevation
     speed: f32,
+    elapsed: f32,
     sprite: SpriteAnimation,
     trail_effect: Option<ParticleEmitter>,
+    rotation_speed: f32,     // For spinning projectiles
 }
 
-fn projectile_position(anim: &ProjectileAnimation, t: f32) -> Vec2 {
-    let x = lerp(anim.start.x, anim.end.x, t);
-    let y = lerp(anim.start.y, anim.end.y, t);
+fn projectile_position(anim: &ProjectileAnimation3D, t: f32) -> Vec3 {
+    let start_screen = hex_to_iso_pixel(anim.start, &projection);
+    let end_screen = hex_to_iso_pixel(anim.end, &projection);
     
-    // Add vertical arc
-    let arc = anim.arc_height * (4.0 * t * (1.0 - t));  // Parabola peaks at t=0.5
+    // Horizontal interpolation
+    let x = lerp(start_screen.x, end_screen.x, t);
+    let base_y = lerp(start_screen.y, end_screen.y, t);
     
-    Vec2::new(x, y - arc)
+    // Elevation interpolation
+    let elevation = lerp(anim.start.elevation as f32, anim.end.elevation as f32, t);
+    
+    // Add parabolic arc (peaks at t=0.5)
+    let arc_offset = anim.arc_height * (4.0 * t * (1.0 - t));
+    
+    Vec3::new(x, base_y - arc_offset, elevation)
+}
+
+impl ProjectileAnimation3D {
+    fn calculate_flight_time(&self) -> f32 {
+        // Account for 3D distance
+        let distance = distance_3d(self.start, self.end);
+        distance / self.speed
+    }
+    
+    fn facing_angle(&self, t: f32) -> f32 {
+        // Projectile rotates to face flight direction
+        let next_t = (t + 0.01).min(1.0);
+        let current_pos = self.projectile_position(t);
+        let next_pos = self.projectile_position(next_t);
+        
+        (next_pos.y - current_pos.y).atan2(next_pos.x - current_pos.x)
+    }
 }
 ```
 
-**Variants**:
-- **Arrow**: Fast, shallow arc
-- **Fireball**: Medium speed, flaming trail
+**Projectile types**:
+- **Arrow**: Fast, low arc, points toward target
+  - Adjusts angle based on elevation difference
+  - Uphill shots arc higher, downhill shots arc lower
+  
+- **Fireball**: Medium speed, moderate arc, leaves flame trail
+  - Trail particles rendered at each frame position
+  - Explosion effect on impact (spherical AoE)
+  
 - **Lightning**: Instant hit with branching effect
-- **Thrown weapon**: Spinning rotation
+  - No arc, straight line from caster to target
+  - Branch particles spawn along path
+  - Accounts for elevation (can hit units on different levels)
+  
+- **Thrown weapon**: Slow, high arc, spinning
+  - Rotates around center during flight
+  - Clinks on ground if misses (physics-based bounce)
+
+- **Meteor**: Falls from above, impacts ground
+  - Starts at elevation + 10, falls to target
+  - Acceleration (gravity simulation)
+  - Large impact crater effect
 
 ## Combat Animations
 
