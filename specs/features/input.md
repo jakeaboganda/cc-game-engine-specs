@@ -219,32 +219,144 @@ struct ContextualInput {
 - ESC pops context back to `InCombat`
 - Prevents accidental menu opens
 
-## Hex Selection
+## Hex Selection (Isometric 3D)
 
-Mouse/cursor to hex conversion:
+Mouse/cursor to hex conversion with elevation handling:
 
 ```rust
-struct HexSelector {
-    current_hex: Option<HexCoord>,
-    hover_hex: Option<HexCoord>,
+struct IsometricHexSelector {
+    current_position: Option<HexPosition>,  // 3D position (hex + elevation)
+    hover_position: Option<HexPosition>,
     selected_unit: Option<EntityId>,
+    elevation_mode: ElevationSelectionMode,
+}
+
+enum ElevationSelectionMode {
+    Auto,        // Automatically pick most likely elevation
+    Fixed(i32),  // Lock to specific elevation level
+    Cycle,       // Cycle through elevations with mouse wheel
 }
 
 fn update_hex_selection(
     input: &InputManager,
-    camera: &Camera,
-    hex_renderer: &HexRenderer,
-) -> Option<HexCoord> {
+    camera: &IsometricCamera,
+    map: &HexMap,
+    mode: &ElevationSelectionMode,
+) -> Option<HexPosition> {
     let screen_pos = input.mouse.position;
     let world_pos = camera.screen_to_world(screen_pos);
-    hex_renderer.pixel_to_hex(world_pos)
+    
+    // Convert screen position to hex (2D)
+    let hex = iso_pixel_to_hex(world_pos, &camera.projection);
+    
+    // Determine elevation
+    let elevation = match mode {
+        ElevationSelectionMode::Auto => {
+            // Pick elevation based on context
+            select_best_elevation(hex, map, input)
+        },
+        ElevationSelectionMode::Fixed(elev) => *elev,
+        ElevationSelectionMode::Cycle => {
+            // User scrolls mouse wheel to change elevation
+            handle_elevation_cycling(hex, input)
+        },
+    };
+    
+    Some(HexPosition { hex, elevation })
+}
+
+fn select_best_elevation(hex: HexCoord, map: &HexMap, input: &InputManager) -> i32 {
+    // Heuristics for picking elevation automatically:
+    
+    // 1. If a unit is at this hex, use unit's elevation
+    if let Some(unit) = map.get_unit_at_hex(hex) {
+        return unit.position.elevation;
+    }
+    
+    // 2. If tile exists at this hex, use tile elevation
+    if let Some(tile) = map.get_tile(hex) {
+        return tile.base_elevation;
+    }
+    
+    // 3. If selecting for movement, use current unit's elevation
+    if let Some(selected_unit) = get_selected_unit() {
+        return selected_unit.position.elevation;
+    }
+    
+    // 4. Default to ground level
+    0
+}
+
+fn handle_elevation_cycling(hex: HexCoord, input: &InputManager) -> i32 {
+    static mut CURRENT_ELEVATION: i32 = 0;
+    
+    unsafe {
+        // Mouse wheel up = increase elevation
+        if input.mouse.wheel_delta > 0.0 {
+            CURRENT_ELEVATION = (CURRENT_ELEVATION + 1).min(map.max_elevation);
+        }
+        // Mouse wheel down = decrease elevation
+        else if input.mouse.wheel_delta < 0.0 {
+            CURRENT_ELEVATION = (CURRENT_ELEVATION - 1).max(map.min_elevation);
+        }
+        
+        CURRENT_ELEVATION
+    }
 }
 ```
 
-**Visual feedback**:
-- Hover highlight (subtle glow)
-- Selected highlight (bright outline)
-- Invalid target (red X or dimmed)
+**Visual feedback** (isometric):
+- **Hover highlight**: Subtle glow on hex at correct elevation
+- **Selected highlight**: Bright outline with elevation indicator
+- **Invalid target**: Red X or dimmed (e.g., can't reach that elevation)
+- **Elevation layers**: Semi-transparent overlay showing different elevation levels
+- **Height markers**: Visual pillar/number showing selected elevation
+
+**Mouse picking challenges in isometric**:
+- Overlapping hexes (higher elevation hexes visually overlap lower ones)
+- Depth ambiguity (which hex did user click?)
+
+**Solutions**:
+1. **Raycasting**: Cast ray from mouse through all hex layers, pick closest to camera
+2. **Depth buffer**: Use GPU depth buffer to determine which sprite was clicked
+3. **Priority system**: Prioritize units > terrain features > ground tiles
+4. **Hover feedback**: Show clearly which hex is under cursor before clicking
+
+**Gamepad hex selection**:
+```rust
+struct GamepadHexCursor {
+    position: HexPosition,
+    move_speed: f32,
+    snap_to_units: bool,  // Auto-snap to nearby units
+}
+
+fn update_gamepad_cursor(cursor: &mut GamepadHexCursor, input: &GamepadState) {
+    // Left stick moves cursor in isometric space
+    let stick_x = input.axes.get(&GamepadAxis::LeftX).unwrap_or(&0.0);
+    let stick_y = input.axes.get(&GamepadAxis::LeftY).unwrap_or(&0.0);
+    
+    // Convert stick input to hex direction
+    if stick_x.abs() > DEADZONE || stick_y.abs() > DEADZONE {
+        let direction = Direction::from_angle(stick_y.atan2(*stick_x));
+        let neighbor = cursor.position.hex.neighbor(direction);
+        
+        cursor.position.hex = neighbor;
+        
+        // Auto-adjust elevation to terrain
+        if let Some(tile) = map.get_tile(neighbor) {
+            cursor.position.elevation = tile.base_elevation;
+        }
+    }
+    
+    // Shoulder buttons change elevation
+    if input.buttons_down.contains(&GamepadButton::LeftBumper) {
+        cursor.position.elevation -= 1;
+    }
+    if input.buttons_down.contains(&GamepadButton::RightBumper) {
+        cursor.position.elevation += 1;
+    }
+}
+```
 
 ## Controller Rumble
 
