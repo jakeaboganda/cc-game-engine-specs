@@ -94,24 +94,77 @@ struct UtilityAI {
 
 **Scoring example**:
 ```rust
-// Attack scoring
-fn score_attack_target(state: &GameState, attacker: EntityId, target: EntityId) -> f32 {
+// Attack scoring (with elevation awareness)
+fn score_attack_target(state: &GameState, attacker: &Entity, target: &Entity) -> f32 {
     let mut score = 0.0;
     
     // Prefer low-health targets (can finish them off)
-    let health_percent = get_health_percent(state, target);
+    let health_percent = target.hp as f32 / target.max_hp as f32;
     score += (1.0 - health_percent) * 30.0;
     
     // Prefer high-threat targets (damage dealers)
     score += get_threat_level(state, target) * 20.0;
     
-    // Prefer closer targets (less movement needed)
-    let distance = hex_distance(attacker, target);
-    score += (10.0 - distance as f32) * 5.0;
+    // Prefer closer targets (less movement needed, 3D distance)
+    let distance = distance_3d(attacker.position, target.position);
+    score += (10.0 - distance) * 5.0;
     
     // Penalize heavily-armored targets
-    let armor = get_armor(state, target);
-    score -= armor as f32 * 2.0;
+    score -= target.armor as f32 * 2.0;
+    
+    // ELEVATION BONUS: High ground advantage
+    let elevation_diff = attacker.position.elevation - target.position.elevation;
+    score += match elevation_diff {
+        d if d >= 2 => 15.0,   // Major high ground - big bonus
+        1 => 10.0,             // Minor high ground - good bonus
+        0 => 0.0,              // Even ground - neutral
+        -1 => -5.0,            // Shooting uphill - penalty
+        _ => -10.0,            // Major disadvantage - big penalty
+    };
+    
+    // Bonus if target is near cliff edge (can knock them off)
+    if is_near_cliff_edge(target.position, 1) && attacker.has_knockback_ability() {
+        score += 12.0;  // Opportunity for massive fall damage
+    }
+    
+    // Penalty if we don't have line of sight (elevation can block)
+    if !has_line_of_sight(attacker.position, target.position, state.map) {
+        score -= 100.0;  // Can't shoot what you can't see
+    }
+    
+    score
+}
+
+// Movement position scoring (elevation-aware)
+fn score_movement_position(pos: HexPosition, unit: &Entity, state: &GameState) -> f32 {
+    let mut score = 0.0;
+    
+    // High ground preference
+    let enemies = state.get_enemies_in_range(pos, 6);
+    for enemy in enemies {
+        let elev_diff = pos.elevation - enemy.position.elevation;
+        score += elev_diff as f32 * 3.0;  // +3 per level advantage
+    }
+    
+    // Cover bonus
+    if provides_cover(pos, state.map) {
+        score += 8.0;
+    }
+    
+    // Avoid cliff edges (unless we can fly)
+    if is_near_cliff_edge(pos, 1) && !unit.can_fly {
+        score -= 10.0;
+    }
+    
+    // Formation bonus (stay near allies)
+    let nearby_allies = state.count_allies_in_range(pos, 3);
+    score += nearby_allies as f32 * 2.0;
+    
+    // Line of sight to enemies
+    let visible_enemies = enemies.iter()
+        .filter(|e| has_line_of_sight(pos, e.position, state.map))
+        .count();
+    score += visible_enemies as f32 * 4.0;
     
     score
 }
@@ -160,22 +213,67 @@ flanking_bonus = 2.0
 **Target selection**:
 - Health remaining (finish weak enemies)
 - Threat level (prioritize dangerous foes)
-- Distance (minimize movement cost)
+- Distance (3D distance accounting for elevation)
 - Armor/resistances (avoid ineffective attacks)
 - Position (can allies follow up?)
+- **Elevation advantage**: Prefer targets at lower elevation (high ground bonus)
+- **Elevation disadvantage**: Avoid attacking uphill unless necessary
 
 **Movement**:
-- Stay in cover when possible
+- **Seek high ground**: Move to elevated positions for combat advantage
+- Stay in cover when possible (elevation-based cover)
 - Maintain formation with allies
-- Control chokepoints
+- Control chokepoints (especially elevated choke points)
 - Avoid area hazards (fire, poison clouds)
-- Flanking opportunities (attack from behind)
+- Flanking opportunities (attack from behind or from higher elevation)
+- **Avoid cliff edges**: Don't position where knockback would cause fall damage
+- **Control ramps/stairs**: Defend access points to elevated positions
+
+**Elevation-specific tactics**:
+```rust
+fn score_position_for_combat(pos: HexPosition, enemies: &[Entity], allies: &[Entity]) -> f32 {
+    let mut score = 0.0;
+    
+    // Bonus for elevation over enemies
+    for enemy in enemies {
+        let elevation_diff = pos.elevation - enemy.position.elevation;
+        match elevation_diff {
+            d if d >= 2 => score += 8.0,   // Major high ground
+            1 => score += 4.0,             // Minor high ground
+            0 => score += 0.0,             // Even ground
+            -1 => score -= 3.0,            // Shooting uphill penalty
+            _ => score -= 6.0,             // Major disadvantage
+        }
+    }
+    
+    // Bonus for line of sight to enemies
+    for enemy in enemies {
+        if has_line_of_sight(pos, enemy.position) {
+            score += 2.0;
+        }
+    }
+    
+    // Penalty for being at cliff edge (risky)
+    if is_near_cliff_edge(pos, 1) {
+        score -= 5.0;
+    }
+    
+    // Bonus for cover
+    if has_cover_from_elevation(pos) {
+        score += 3.0;
+    }
+    
+    score
+}
+```
 
 **Ability usage**:
-- Use AoE when hitting 2+ enemies
+- Use AoE when hitting 2+ enemies (account for vertical spread)
 - Save powerful abilities for high-value targets
 - Use buffs early in combat
 - Use heals when ally below threshold
+- **Use knockback** to push enemies off cliffs (massive damage from fall)
+- **Meteor/bombardment abilities** from high ground for maximum effect
 
 ### Information & Uncertainty
 
